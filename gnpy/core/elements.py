@@ -338,7 +338,6 @@ class Fiber(_Node):
         else:
             self.lumped_losses = None
             self.z_lumped_losses = None
-        self.nli_solver = NliSolver(self)
 
     @property
     def to_json(self):
@@ -395,12 +394,6 @@ class Fiber(_Node):
         """
         return self._loss_coef_fuction(frequency) / (10 * log10(exp(1)))
 
-    def effective_length(self, frequency):
-        return (1 - exp(- self.alpha(frequency) * self.params.length)) / self.alpha(frequency)
-
-    def asymptotic_length(self, frequency):
-        return 1 / self.alpha(frequency)
-
     def cr(self, frequency):
         """
         It returns the raman efficiency matrix including the vibrational loss
@@ -452,13 +445,12 @@ class Fiber(_Node):
             stimulated_raman_scattering = \
                 RamanSolver.calculate_stimulated_raman_scattering(spectral_info, self, sim_params)
             attenuation_fiber = stimulated_raman_scattering.power_profile[:, -1]
-            self.nli_solver.stimulated_raman_scattering = stimulated_raman_scattering
         else:
+            stimulated_raman_scattering = None
             attenuation_fiber = self.lin_attenuation(spectral_info.frequency)
-            self.nli_solver.stimulated_raman_scattering = None
 
         # nli noise evaluated at the fiber input
-        spectral_info.nli += self.nli_solver.compute_nli(spectral_info)
+        spectral_info.nli += NliSolver.compute_nli(spectral_info, stimulated_raman_scattering, self, sim_params)
 
         # chromatic dispersion and pmd variations
         spectral_info.chromatic_dispersion += self.chromatic_dispersion(spectral_info.frequency)
@@ -517,10 +509,9 @@ class RamanFiber(Fiber):
         stimulated_raman_scattering = RamanSolver.calculate_stimulated_raman_scattering(spectral_info, self, sim_params)
         spontaneous_raman_scattering = \
             RamanSolver.calculate_spontaneous_raman_scattering(spectral_info, stimulated_raman_scattering, self)
-        self.nli_solver.stimulated_raman_scattering = stimulated_raman_scattering
 
         # nli and ase noise evaluated at the fiber input
-        spectral_info.nli += self.nli_solver.compute_nli(spectral_info)
+        spectral_info.nli += NliSolver.compute_nli(spectral_info, stimulated_raman_scattering, self, sim_params)
         spectral_info.ase += spontaneous_raman_scattering
 
         # chromatic dispersion and pmd variations
