@@ -339,12 +339,15 @@ class Fiber(_Node):
         if self.params.lumped_losses:
             z_lumped_losses = array([lumped['position'] for lumped in self.params.lumped_losses])  # km
             lumped_losses_power = array([lumped['loss'] for lumped in self.params.lumped_losses])  # dB
-            self.lumped_losses = db2lin(- lumped_losses_power)  # linear units
-            self.z_lumped_losses = array(z_lumped_losses) * 1e3  # m
+            if not ((z_lumped_losses > 0) * (z_lumped_losses < 1e-3 * self.params.length)).all():
+                raise NetworkTopologyError(
+                    f"Lumped loss positions must be between 0 and the fiber length ({1e-3 * self.params.length} km), " +
+                    f"boundaries excluded.")
+            self.lumped_losses = db2lin(- lumped_losses_power)  # [linear units]
+            self.z_lumped_losses = array(z_lumped_losses) * 1e3  # [m]
         else:
             self.lumped_losses = None
             self.z_lumped_losses = None
-        self.nli_solver = NliSolver(self)
 
     @property
     def to_json(self):
@@ -401,12 +404,6 @@ class Fiber(_Node):
         """
         return self._loss_coef_fuction(frequency) / (10 * log10(exp(1)))
 
-    def effective_length(self, frequency):
-        return (1 - exp(- self.alpha(frequency) * self.params.length)) / self.alpha(frequency)
-
-    def asymptotic_length(self, frequency):
-        return 1 / self.alpha(frequency)
-
     def cr(self, frequency):
         """It returns the raman efficiency matrix including the vibrational loss
 
@@ -457,20 +454,18 @@ class Fiber(_Node):
         if sim_params.raman_params.flag:
             stimulated_raman_scattering = \
                 RamanSolver.calculate_stimulated_raman_scattering(spectral_info, self, sim_params)
-            attenuation_fiber = stimulated_raman_scattering.power_profile[:, -1]
-            self.nli_solver.stimulated_raman_scattering = stimulated_raman_scattering
         else:
-            attenuation_fiber = self.lin_attenuation(spectral_info.frequency)
-            self.nli_solver.stimulated_raman_scattering = None
+            stimulated_raman_scattering = RamanSolver.calculate_attenuation_profile(spectral_info, self, sim_params)
 
         # nli noise evaluated at the fiber input
-        spectral_info.nli += self.nli_solver.compute_nli(spectral_info)
+        spectral_info.nli += NliSolver.compute_nli(spectral_info, stimulated_raman_scattering, self, sim_params)
 
         # chromatic dispersion and pmd variations
         spectral_info.chromatic_dispersion += self.chromatic_dispersion(spectral_info.frequency)
         spectral_info.pmd = sqrt(spectral_info.pmd ** 2 + self.pmd ** 2)
 
         # apply the attenuation due to the fiber losses
+        attenuation_fiber = stimulated_raman_scattering.loss_profile[:, -1]
         spectral_info.signal *= attenuation_fiber
         spectral_info.nli *= attenuation_fiber
         spectral_info.ase *= attenuation_fiber
@@ -522,10 +517,9 @@ class RamanFiber(Fiber):
         stimulated_raman_scattering = RamanSolver.calculate_stimulated_raman_scattering(spectral_info, self, sim_params)
         spontaneous_raman_scattering = \
             RamanSolver.calculate_spontaneous_raman_scattering(spectral_info, stimulated_raman_scattering, self)
-        self.nli_solver.stimulated_raman_scattering = stimulated_raman_scattering
 
         # nli and ase noise evaluated at the fiber input
-        spectral_info.nli += self.nli_solver.compute_nli(spectral_info)
+        spectral_info.nli += NliSolver.compute_nli(spectral_info, stimulated_raman_scattering, self, sim_params)
         spectral_info.ase += spontaneous_raman_scattering
 
         # chromatic dispersion and pmd variations

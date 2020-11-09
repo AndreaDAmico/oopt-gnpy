@@ -11,7 +11,8 @@ The solvers take as input instances of the spectral information, the fiber and t
 """
 
 from numpy import interp, pi, zeros, shape, where, cos, array, append, ones, argsort, exp, arange, sqrt, empty, trapz, \
-    arcsinh, clip, abs, sum, concatenate, unique, flip, outer, inner, transpose, max, format_float_scientific
+    arcsinh, clip, abs, sum, concatenate, unique, flip, outer, inner, transpose, max, format_float_scientific, \
+    argwhere, prod
 from logging import getLogger
 from scipy.constants import pi, k, h
 from scipy.interpolate import interp1d
@@ -65,6 +66,30 @@ class StimulatedRamanScattering:
 
 class RamanSolver:
     """This class contains the methods to calculate the Raman scattering effect."""
+
+    @staticmethod
+    def calculate_attenuation_profile(spectral_info, fiber, sim_params):
+        """This function evaluates the attenuation profile along the z axis for all the frequency propagating in the
+        fiber without considering the stimulated Raman scattering.
+        :param spectral_info: instance of gnpy.core.info.SpectralInformation
+        :param fiber: instance of gnpy.core.elements.Fiber or gnpy.core.elements.RamanFiber
+        :param sim_params: instance of gnpy.core.parameters.SimParams
+        :return: instance of StimulatedRamanScattering
+        """
+        # z array definition
+        z_resolution = sim_params.raman_params.spatial_resolution
+        z = append(arange(0, fiber.params.length, z_resolution), fiber.params.length)
+        # Lumped losses array definition
+        if fiber.lumped_losses is not None:
+            lumped_loss_acc = array([prod(fiber.lumped_losses[argwhere(z_i > fiber.z_lumped_losses)]) for z_i in z])
+        else:
+            lumped_loss_acc = ones(z.size)
+        frequency = spectral_info.frequency
+        alpha = fiber.alpha(frequency)
+        loss_profile = exp(- outer(alpha, z)) * lumped_loss_acc
+        power_profile = outer(spectral_info.signal, ones(z.size)) * loss_profile
+        stimulated_raman_scattering = StimulatedRamanScattering(power_profile, loss_profile, frequency, z)
+        return stimulated_raman_scattering
 
     @staticmethod
     def calculate_stimulated_raman_scattering(spectral_info, fiber, sim_params):
@@ -129,7 +154,7 @@ class RamanSolver:
             if co_frequency.size and cnt_frequency.size:
                 co_power_profile, cnt_power_profile = \
                     RamanSolver.iterative_algorithm(co_power_profile, cnt_power_profile,
-                                                    co_frequency, cnt_frequency, z, fiber)
+                                                    co_frequency, cnt_frequency, z, fiber, lumped_losses)
             # Complete Power Profile
             power_profile = concatenate((co_power_profile, cnt_power_profile), axis=0)
             # Complete Loss Profile
@@ -199,7 +224,8 @@ class RamanSolver:
         return power
 
     @staticmethod
-    def iterative_algorithm(co_initial_guess_power, cnt_initial_guess_power, co_frequency, cnt_frequency, z, fiber):
+    def iterative_algorithm(co_initial_guess_power, cnt_initial_guess_power, co_frequency, cnt_frequency, z, fiber,
+                            lumped_losses=None):
         """This function solves the Raman first order derivative equation in case of both co- and counter-propagating
         frequencies
 
@@ -209,6 +235,7 @@ class RamanSolver:
         :param cnt_frequency: counter-propagationg frequencies
         :param z: z position array
         :param fiber: instance of gnpy.core.elements.Fiber or gnpy.core.elements.RamanFiber
+        :param lumped_losses: concentrated losses array along the fiber span
         :return: co- and counter-propagatng power profile matrix
         """
         logger.debug('  Start iterative algorithm')
@@ -223,21 +250,25 @@ class RamanSolver:
         dz = z[1:] - z[:-1]
         cr = fiber.cr(frequency)
         alpha = fiber.alpha(frequency)
+        lumped_losses = lumped_losses if not (lumped_losses is None) else ones(z.size)
         next_power = array(prev_power)
         while residue > residue_tol and accuracy > accuracy_tol and iteration < num_max_iter:
             iteration += 1
             for i in range(1, z.size):
                 dpdz = - alpha + sum(cr * next_power[:, i - 1], 1)
                 next_power[:co_frequency.size, i] = \
-                    next_power[:co_frequency.size, i - 1] * (1 + dpdz[:co_frequency.size] * dz[i - 1])
+                    next_power[:co_frequency.size, i - 1] * (1 + dpdz[:co_frequency.size] * dz[i - 1]) *\
+                    lumped_losses[i - 1]
             for i in range(1, z.size):
                 dpdz = - alpha + sum(cr * next_power[:, -i], 1)
                 next_power[co_frequency.size:, -i - 1] = \
-                    next_power[co_frequency.size:, -i] * (1 + dpdz[co_frequency.size:] * dz[-i])
+                    next_power[co_frequency.size:, -i] * (1 + dpdz[co_frequency.size:] * dz[-i]) *\
+                    lumped_losses[-i]
 
             dpdz_num = (next_power[:co_frequency.size, 1:] - next_power[:co_frequency.size, :-1]) / dz
             dpdz_exp = next_power[:co_frequency.size, :-1] * \
-                (- outer(alpha, ones(z.size)) + inner(cr, transpose(next_power)))[:co_frequency.size, :-1]
+                (- outer(alpha, ones(z.size)) + inner(cr, transpose(next_power)))[:co_frequency.size, :-1] *\
+                lumped_losses[:-1]
 
             residue = max(abs((next_power - prev_power) / next_power))
             accuracy = max(abs((dpdz_exp - dpdz_num) / dpdz_exp))
@@ -254,68 +285,60 @@ class NliSolver:
         'ggn_spectrally_separated': XPM plus SPM
     """
 
-    def __init__(self, fiber=None):
-        """ Initialize the Nli solver object.
-        :param fiber: instance of elements.py/Fiber.
-        """
-        self._fiber = fiber
-        self._stimulated_raman_scattering = None
+    @staticmethod
+    def effective_length(alpha, length):
+        return (1 - exp(- alpha * length)) / alpha
 
-    @property
-    def fiber(self):
-        return self._fiber
-
-    @property
-    def stimulated_raman_scattering(self):
-        return self._stimulated_raman_scattering
-
-    @stimulated_raman_scattering.setter
-    def stimulated_raman_scattering(self, stimulated_raman_scattering):
-        self._stimulated_raman_scattering = stimulated_raman_scattering
-
-    def compute_nli(self, spectral_info):
+    @staticmethod
+    def compute_nli(spectral_info, srs, fiber, sim_params):
         """ Compute NLI power generated by the WDM comb `*carriers` on the channel under test `carrier`
         at the end of the fiber span.
         """
-        sim_params = SimParams.get()
+        # Physical fiber parameters
+        alpha = fiber.alpha(spectral_info.frequency)
+        beta2 = fiber.params.beta2
+        beta3 = fiber.params.beta3
+        f_ref_beta = fiber.params.ref_frequency
+        gamma = fiber.params.gamma
+        length = fiber.params.length
+
         if 'gn_model_analytic' == sim_params.nli_params.method.lower():
-            nli = self._gn_analytic(spectral_info)
+            nli = NliSolver._gn_analytic(spectral_info, alpha, beta2, gamma, length)
         elif 'ggn_spectrally_separated' in sim_params.nli_params.method.lower():
-            nli = self._ggn_spectrally_separated(spectral_info)
+            nli = NliSolver._ggn_spectrally_separated(spectral_info, srs, alpha, beta2, beta3, f_ref_beta, gamma)
         else:
             raise ValueError(f'Method {sim_params.nli_params.method} not implemented.')
         return nli
 
     # Methods for computing GN-model
-    def _gn_analytic(self, spectral_info):
+    @staticmethod
+    def _gn_analytic(spectral_info, alpha, beta2, gamma, length):
         """ Computes the nonlinear interference power on a single carrier.
         The method uses eq. 120 from arXiv:1209.0394.
         """
-        gamma = self.fiber.params.gamma
         g_cut = spectral_info.signal / spectral_info.baud_rate
         spm_weight = (16.0 / 27.0) * gamma ** 2
         xpm_weight = 2 * (16.0 / 27.0) * gamma ** 2
 
         g_nli = zeros(spectral_info.frequency.shape)
         for i, cut_carrier in enumerate(spectral_info.carriers):
-            for pump_carrier in spectral_info.carriers:
+            for j, pump_carrier in enumerate(spectral_info.carriers):
                 dn = pump_carrier.channel_number - cut_carrier.channel_number
                 if dn == 0:  # SPM
                     ggg = g_cut[i] ** 3
-                    g_nli[i] += spm_weight * ggg * self._psi(cut_carrier, cut_carrier)
+                    g_nli[i] += spm_weight * ggg * NliSolver._psi(cut_carrier, cut_carrier, alpha[j], beta2, length)
                 else:  # XPM
                     g_pump = pump_carrier.power.signal / pump_carrier.baud_rate
                     ggg = g_cut[i] * g_pump ** 2
-                    g_nli[i] += xpm_weight * ggg * self._psi(cut_carrier, pump_carrier)
-
+                    g_nli[i] += xpm_weight * ggg * NliSolver._psi(cut_carrier, pump_carrier, alpha[j], beta2, length)
         nli = spectral_info.baud_rate * g_nli  # Local white noise
         return nli
 
-    def _psi(self, cut_carrier, pump_carrier):
+    @staticmethod
+    def _psi(cut_carrier, pump_carrier, alpha, beta2, length):
         """Calculates eq. 123 from `arXiv:1209.0394 <https://arxiv.org/abs/1209.0394>`__"""
-        beta2 = self.fiber.params.beta2
-        effective_length = self.fiber.effective_length(cut_carrier.frequency)
-        asymptotic_length = self.fiber.asymptotic_length(cut_carrier.frequency)
+        effective_length = NliSolver.effective_length(alpha, length)
+        asymptotic_length = 1 / alpha
 
         if cut_carrier.channel_number == pump_carrier.channel_number:  # SCI, SPM
             psi = arcsinh(0.5 * pi ** 2 * asymptotic_length * abs(beta2) * cut_carrier.baud_rate ** 2)
@@ -329,8 +352,8 @@ class NliSolver:
         return psi
 
     # Methods for computing the GGN-model
-    def _ggn_spectrally_separated(self, spectral_info):
-        gamma = self.fiber.params.gamma
+    @staticmethod
+    def _ggn_spectrally_separated(spectral_info, srs, alpha, beta2, beta3, f_ref_beta, gamma):
         sim_params = SimParams.get()
         dispersion_tolerance = sim_params.nli_params.dispersion_tolerance
         phase_shift_tolerance = sim_params.nli_params.phase_shift_tolerance
@@ -341,61 +364,56 @@ class NliSolver:
         cuts = [carrier for carrier in spectral_info.carriers if carrier.channel_number
                 in sim_params.nli_params.computed_channels] if sim_params.nli_params.computed_channels \
             else spectral_info.carriers
-        alpha = self.fiber.alpha(self.fiber.ref_frequency)
-        beta2 = self.fiber.params.beta2
 
         g_nli = array([])
         f_nli = array([])
         for cut_carrier in cuts:
+            i = cut_carrier.channel_number - 1
+            f_eval = cut_carrier.frequency
             g_nli_computed = 0
             g_cut = (cut_carrier.power.signal / cut_carrier.baud_rate)
-            for pump_carrier in spectral_info.carriers:
+            for j, pump_carrier in enumerate(spectral_info.carriers):
                 dn = abs(pump_carrier.channel_number - cut_carrier.channel_number)
                 delta_f = abs(cut_carrier.frequency - pump_carrier.frequency)
-                k_tol = dispersion_tolerance * abs(alpha)
+                k_tol = dispersion_tolerance * abs(alpha[j])
                 phi_tol = phase_shift_tolerance / delta_z
                 f_cut_resolution = min(k_tol, phi_tol) / abs(beta2) / (4 * pi ** 2 * (1 + dn) * slot_width)
                 f_pump_resolution = min(k_tol, phi_tol) / abs(beta2) / (4 * pi ** 2 * slot_width)
                 if dn == 0:  # SPM
                     ggg = g_cut ** 3
                     g_nli_computed += \
-                        spm_weight * ggg * self._generalized_psi(cut_carrier, cut_carrier, cut_carrier.frequency,
-                                                                 f_cut_resolution, f_cut_resolution)
+                        spm_weight * ggg * NliSolver._generalized_psi(f_eval, cut_carrier, pump_carrier,
+                                                                      f_cut_resolution, f_pump_resolution,
+                                                                      srs, alpha[i], beta2, beta3, f_ref_beta)
                 else:  # XPM
                     g_pump = (pump_carrier.power.signal / pump_carrier.baud_rate)
                     ggg = g_cut * g_pump ** 2
-                    frequency_offset_threshold = self._frequency_offset_threshold(pump_carrier.baud_rate)
+                    frequency_offset_threshold = NliSolver._frequency_offset_threshold(beta2, pump_carrier.baud_rate)
                     if abs(delta_f) <= frequency_offset_threshold:
                         g_nli_computed += \
-                            xpm_weight * ggg * self._generalized_psi(cut_carrier, pump_carrier, cut_carrier.frequency,
-                                                                     f_cut_resolution, f_pump_resolution)
+                            xpm_weight * ggg * NliSolver._generalized_psi(f_eval, cut_carrier, pump_carrier,
+                                                                          f_cut_resolution, f_pump_resolution,
+                                                                          srs, alpha[i], beta2, beta3, f_ref_beta)
                     else:
                         g_nli_computed += \
-                            xpm_weight * ggg * self._fast_generalized_psi(cut_carrier, pump_carrier,
-                                                                          cut_carrier.frequency, f_cut_resolution)
+                            xpm_weight * ggg * NliSolver._fast_generalized_psi(f_eval, cut_carrier, pump_carrier,
+                                                                               f_cut_resolution, srs, alpha[i], beta2,
+                                                                               beta3, f_ref_beta)
             f_nli = append(f_nli, cut_carrier.frequency)
             g_nli = append(g_nli, g_nli_computed)
         g_nli = interp(spectral_info.frequency, f_nli, g_nli)
         nli = spectral_info.baud_rate * g_nli  # Local white noise
         return nli
 
-    def _fast_generalized_psi(self, cut_carrier, pump_carrier, f_eval, f_cut_resolution):
+    @staticmethod
+    def _fast_generalized_psi(f_eval, cut_carrier, pump_carrier, f_cut_resolution, srs, alpha, beta2, beta3,
+                              f_ref_beta):
         """ It computes the generalized psi function similarly to the one used in the GN model
         :return: generalized_psi
         """
-        # Fiber parameters
-        alpha = self.fiber.alpha(f_eval)
-        beta2 = self.fiber.params.beta2
-        beta3 = self.fiber.params.beta3
-        f_ref_beta = self.fiber.params.ref_frequency
-        z = self.stimulated_raman_scattering.z
-        frequency_rho = self.stimulated_raman_scattering.frequency
-        rho_norm = self.stimulated_raman_scattering.rho * exp(abs(alpha) * z / 2)
-        if len(frequency_rho) == 1:
-            def rho_function(f): return rho_norm[0,:]
-        else:
-            rho_function = interp1d(frequency_rho, rho_norm, axis=0, fill_value='extrapolate')
-        rho_norm_pump = rho_function(pump_carrier.frequency)
+        z = srs.z
+        rho_norm = srs.rho * exp(outer(alpha/2, z))
+        rho_pump = interp1d(srs.frequency, rho_norm, axis=0)(pump_carrier.frequency)
 
         f1_array = array([pump_carrier.frequency - (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2),
                           pump_carrier.frequency + (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2)])
@@ -407,28 +425,20 @@ class NliSolver:
         for f1_index, f1 in enumerate(f1_array):
             delta_beta = 4 * pi**2 * (f1 - f_eval) * (f2_array - f_eval) * \
                          (beta2 + pi * beta3 * (f1 + f2_array - 2 * f_ref_beta))
-            integrand_f2 = self._generalized_rho_nli(delta_beta, rho_norm_pump, z, alpha)
+            integrand_f2 = NliSolver._generalized_rho_nli(delta_beta, rho_pump, z, alpha)
             integrand_f1[f1_index] = 2 * trapz(integrand_f2, f2_array)  # 2x since integrand_f2 is symmetric in f2
         generalized_psi = 0.5 * sum(integrand_f1) * pump_carrier.baud_rate
         return generalized_psi
 
-    def _generalized_psi(self, cut_carrier, pump_carrier, f_eval, f_cut_resolution, f_pump_resolution):
+    @staticmethod
+    def _generalized_psi(f_eval, cut_carrier, pump_carrier, f_cut_resolution, f_pump_resolution, srs, alpha, beta2,
+                         beta3, f_ref_beta):
         """ It computes the generalized psi function similarly to the one used in the GN model
         :return: generalized_psi
         """
-        # Fiber parameters
-        alpha = self.fiber.alpha(f_eval)
-        beta2 = self.fiber.params.beta2
-        beta3 = self.fiber.params.beta3
-        f_ref_beta = self.fiber.params.ref_frequency
-        z = self.stimulated_raman_scattering.z
-        frequency_rho = self.stimulated_raman_scattering.frequency
-        rho_norm = self.stimulated_raman_scattering.rho * exp(abs(alpha) * z / 2)
-        if len(frequency_rho) == 1:
-            def rho_function(f): return rho_norm[0,:]
-        else:
-            rho_function = interp1d(frequency_rho, rho_norm, axis=0, fill_value='extrapolate')
-        rho_norm_pump = rho_function(pump_carrier.frequency)
+        z = srs.z
+        rho_norm = srs.rho * exp(outer(alpha/2, z))
+        rho_pump = interp1d(srs.frequency, rho_norm, axis=0)(pump_carrier.frequency)
 
         f1_array = arange(pump_carrier.frequency - (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2),
                           pump_carrier.frequency + (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2),
@@ -444,31 +454,30 @@ class NliSolver:
             psd2 = raised_cosine_comb(f2_array, cut_carrier) * (cut_carrier.baud_rate / cut_carrier.power.signal)
             psd3 = raised_cosine_comb(f3_array, pump_carrier) * (pump_carrier.baud_rate / pump_carrier.power.signal)
             ggg = psd1_sample * psd2 * psd3
-
             delta_beta = 4 * pi**2 * (f1 - f_eval) * (f2_array - f_eval) * \
                 (beta2 + pi * beta3 * (f1 + f2_array - 2 * f_ref_beta))
-
-            integrand_f2 = ggg * self._generalized_rho_nli(delta_beta, rho_norm_pump, z, alpha)
+            integrand_f2 = ggg * NliSolver._generalized_rho_nli(delta_beta, rho_pump, z, alpha)
             integrand_f1[f1_index] = trapz(integrand_f2, f2_array)
         generalized_psi = trapz(integrand_f1, f1_array)
         return generalized_psi
 
     @staticmethod
-    def _generalized_rho_nli(delta_beta, rho_norm_pump, z, alpha0):
-        w = 1j * delta_beta - alpha0
-        generalized_rho_nli = (rho_norm_pump[-1]**2 * exp(w * z[-1]) - rho_norm_pump[0]**2 * exp(w * z[0])) / w
+    def _generalized_rho_nli(delta_beta, rho_pump, z, alpha):
+        w = 1j * delta_beta - alpha
+        generalized_rho_nli = (rho_pump[-1]**2 * exp(w * z[-1]) - rho_pump[0]**2 * exp(w * z[0])) / w
         for z_ind in range(0, len(z) - 1):
-            derivative_rho = (rho_norm_pump[z_ind + 1]**2 - rho_norm_pump[z_ind]**2) / (z[z_ind + 1] - z[z_ind])
+            derivative_rho = (rho_pump[z_ind + 1]**2 - rho_pump[z_ind]**2) / (z[z_ind + 1] - z[z_ind])
             generalized_rho_nli -= derivative_rho * (exp(w * z[z_ind + 1]) - exp(w * z[z_ind])) / (w**2)
         generalized_rho_nli = abs(generalized_rho_nli)**2
         return generalized_rho_nli
 
-    def _frequency_offset_threshold(self, symbol_rate):
+    @staticmethod
+    def _frequency_offset_threshold(beta2, symbol_rate):
         k_ref = 5
         beta2_ref = 21.3e-27
         delta_f_ref = 50e9
         rs_ref = 32e9
-        beta2 = abs(self.fiber.params.beta2)
+        beta2 = abs(beta2)
         freq_offset_th = ((k_ref * delta_f_ref) * rs_ref * beta2_ref) / (beta2 * symbol_rate)
         return freq_offset_th
 
