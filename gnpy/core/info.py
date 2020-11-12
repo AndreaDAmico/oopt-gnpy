@@ -101,6 +101,10 @@ class SpectralInformation(object):
         return [Power(*p) for p in powers]
 
     @property
+    def psd(self):
+        return self.signal/self.baud_rate  # power spectral density [W s]
+
+    @property
     def signal(self):
         return self._signal
 

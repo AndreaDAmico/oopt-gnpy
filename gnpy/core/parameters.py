@@ -48,6 +48,7 @@ class NLIParams(Parameters):
         self.dispersion_tolerance = nli_params['dispersion_tolerance'] if 'dispersion_tolerance' in nli_params else 1
         self.phase_shift_tolerance = nli_params['phase_shift_tolerance'] if 'phase_shift_tolerance' in nli_params else 0.1
         self.computed_channels = nli_params['computed_channels'] if 'computed_channels' in nli_params else None
+        self.cuts_indices = [index - 1 for index in self.computed_channels] if self.computed_channels else None
 
 
 class SimParams(Parameters):
