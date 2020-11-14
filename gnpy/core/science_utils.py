@@ -12,12 +12,13 @@ The solvers take as input instances of the spectral information, the fiber and t
 
 from numpy import interp, pi, zeros, shape, where, cos, array, append, ones, argsort, exp, arange, sqrt, empty, trapz, \
     arcsinh, clip, abs, sum, concatenate, unique, flip, outer, inner, transpose, max, format_float_scientific, \
-    argwhere, prod, diag
+    argwhere, prod, diag, sin, log, reshape
 from logging import getLogger
 from scipy.constants import pi, k, h
 from scipy.interpolate import interp1d
 from math import isclose
 import matplotlib.pyplot as plt
+from time import  time
 
 from gnpy.core.utils import db2lin, lin2db
 from gnpy.core.exceptions import EquipmentConfigError
@@ -39,8 +40,9 @@ def raised_cosine(abscissa, centrum, support, roll_off):
     stop_band = support/2 * (1 + roll_off)
     psd = zeros(abscissa.shape)
     psd += 1 * (abscissa <= pass_band)
-    transient = argwhere((pass_band < abscissa) * (abscissa < stop_band))
-    psd[transient] = 0.5 * (1 + cos(pi / (support * roll_off) * (abscissa[transient] - support/2 * (1 - roll_off))))
+    if roll_off != 0:
+        transient = (pass_band < abscissa) * (abscissa < stop_band)
+        psd[transient] = 0.5 * (1 + cos(pi / (support * roll_off) * (abscissa[transient] - support/2 * (1 - roll_off))))
     return psd
 
 
@@ -329,7 +331,7 @@ class NliSolver:
         if 'gn_model_analytic' == sim_params.nli_params.method.lower():
             nli = NliSolver._gn_model_analytic(spectral_info, alpha, beta2, gamma, length)
         elif 'ggn_model_numeric' in sim_params.nli_params.method.lower():
-            nli = NliSolver._ggn_model_numeric(spectral_info, srs, alpha, beta2, beta3, f_ref_beta, gamma, sim_params)
+            nli = NliSolver._ggn_model_numeric(spectral_info, srs, beta2, gamma, length)
         elif 'ggn_spectrally_separated' in sim_params.nli_params.method.lower():
             nli = NliSolver._ggn_spectrally_separated(spectral_info, srs, alpha, beta2, beta3, f_ref_beta, gamma,
                                                       sim_params)
@@ -380,93 +382,55 @@ class NliSolver:
 
     # Numericc methods computing the NLI with the GGN-model
     @staticmethod
-    def _ggn_model_numeric(spectral_info, srs, alpha, beta2, beta3, f_ref_beta, gamma, sim_params):
-        dispersion_tolerance = sim_params.nli_params.dispersion_tolerance
-        phase_shift_tolerance = sim_params.nli_params.phase_shift_tolerance
-        slot_width = max(spectral_info.slot_width)
-        delta_z = sim_params.raman_params.spatial_resolution
-        spm_weight = (16.0 / 27.0) * gamma ** 2
-        xpm_weight = 2 * (16.0 / 27.0) * gamma ** 2
-        cuts = [carrier for carrier in spectral_info.carriers if carrier.channel_number
-                in sim_params.nli_params.computed_channels] if sim_params.nli_params.computed_channels \
-            else spectral_info.carriers
+    def _ggn_model_numeric(spectral_info, srs, beta2, gamma, length):
+        """ Computes the nonlinear interference power on a single carrier.
+        The method uses eq. 120 from arXiv:1209.0394.
+        """
+        g_cut = spectral_info.signal / spectral_info.baud_rate
+        spm_weight = 1 * (64 / 81) * (5 / 6) * (6 / 8) * gamma ** 2
+        xpm_weight = 2 * (64 / 81) * (5 / 6) * (4 / 8) * gamma ** 2
 
-        g_nli = array([])
-        f_nli = array([])
-        for cut_carrier in cuts:
-            i = cut_carrier.channel_number - 1
-            f_eval = cut_carrier.frequency
-            g_nli_computed = 0
-            g_cut = (cut_carrier.power.signal / cut_carrier.baud_rate)
-            for j, pump_carrier in enumerate(spectral_info.carriers):
-                dn = abs(pump_carrier.channel_number - cut_carrier.channel_number)
-                delta_f = abs(cut_carrier.frequency - pump_carrier.frequency)
-                k_tol = dispersion_tolerance * abs(alpha[j])
-                phi_tol = phase_shift_tolerance / delta_z
-                f_cut_resolution = min(k_tol, phi_tol) / abs(beta2) / (4 * pi ** 2 * (1 + dn) * slot_width)
-                f_pump_resolution = min(k_tol, phi_tol) / abs(beta2) / (4 * pi ** 2 * slot_width)
+        g_nli = zeros(spectral_info.frequency.shape)
+        for i, cut_carrier in enumerate(spectral_info.carriers):
+            for pump_carrier in spectral_info.carriers:
+                dn = pump_carrier.channel_number - cut_carrier.channel_number
                 if dn == 0:  # SPM
-                    ggg = g_cut ** 3
-                    g_nli_computed += \
-                        spm_weight * ggg * NliSolver._generalized_psi(f_eval, cut_carrier, pump_carrier,
-                                                                      f_cut_resolution, f_pump_resolution,
-                                                                      srs, alpha[i], beta2, beta3, f_ref_beta)
+                    ggg = g_cut[i] ** 3
+                    g_nli[i] += spm_weight * ggg * NliSolver._ggn_numeric_psi(cut_carrier, cut_carrier, srs, beta2, length)
                 else:  # XPM
-                    g_pump = (pump_carrier.power.signal / pump_carrier.baud_rate)
-                    ggg = g_cut * g_pump ** 2
-                    frequency_offset_threshold = NliSolver._frequency_offset_threshold(beta2, pump_carrier.baud_rate)
-                    if abs(delta_f) <= frequency_offset_threshold:
-                        g_nli_computed += \
-                            xpm_weight * ggg * NliSolver._generalized_psi(f_eval, cut_carrier, pump_carrier,
-                                                                          f_cut_resolution, f_pump_resolution,
-                                                                          srs, alpha[i], beta2, beta3, f_ref_beta)
-                    else:
-                        g_nli_computed += \
-                            xpm_weight * ggg * NliSolver._fast_generalized_psi(f_eval, cut_carrier, pump_carrier,
-                                                                               f_cut_resolution, srs, alpha[i], beta2,
-                                                                               beta3, f_ref_beta)
-            f_nli = append(f_nli, cut_carrier.frequency)
-            g_nli = append(g_nli, g_nli_computed)
-        g_nli = interp(spectral_info.frequency, f_nli, g_nli)
+                    g_pump = pump_carrier.power.signal / pump_carrier.baud_rate
+                    ggg = g_cut[i] * g_pump ** 2
+                    g_nli[i] += xpm_weight * ggg * NliSolver._ggn_numeric_psi(cut_carrier, cut_carrier, srs, beta2, length)
+
         nli = spectral_info.baud_rate * g_nli  # Local white noise
         return nli
 
     @staticmethod
-    def _ggn_numeric_psi(f_eval, cut_carrier, pump_carrier, f_cut_resolution, f_pump_resolution, srs, alpha, beta2,
-                         beta3, f_ref_beta):
+    def _ggn_numeric_psi(cut_carrier, pump_carrier, srs, beta2, length):
         """ It computes the generalized psi function similarly to the one used in the GN model
         :return: generalized_psi
         """
+
         z = srs.z
-        rho_norm = srs.rho * exp(outer(alpha/2, z))
+        rho_norm = srs.rho
         rho_pump = interp1d(srs.frequency, rho_norm, axis=0)(pump_carrier.frequency)
+        dz = z[1:] - z[:-1]
+        alpha_z = - 2 * log(rho_pump[1:] / rho_pump[:-1]) / dz
+        alpha = - 2 * log(rho_pump[-1] / rho_pump[0]) / z[-1]
+        effective_length = NliSolver.effective_length(alpha, length)
+        asymptotic_length = 1 / alpha
 
-        f1_array = arange(pump_carrier.frequency - (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2),
-                          pump_carrier.frequency + (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2),
-                          f_pump_resolution)
-        f2_array = arange(cut_carrier.frequency - (cut_carrier.baud_rate * (1 + cut_carrier.roll_off) / 2),
-                          cut_carrier.frequency + (cut_carrier.baud_rate * (1 + cut_carrier.roll_off) / 2),
-                          f_cut_resolution)
-        psd1 = raised_cosine_comb(f1_array, pump_carrier) * (pump_carrier.baud_rate / pump_carrier.power.signal)
+        if cut_carrier.channel_number == pump_carrier.channel_number:  # SCI, SPM
+            psi = arcsinh(0.5 * pi ** 2 * asymptotic_length * abs(beta2) * cut_carrier.baud_rate ** 2)
+        else:  # XCI, XPM
+            delta_f = cut_carrier.frequency - pump_carrier.frequency
+            psi = 0.5 * arcsinh(pi ** 2 * asymptotic_length * abs(beta2) * cut_carrier.baud_rate *
+                                (delta_f + 0.5 * pump_carrier.baud_rate))
+            psi -= 0.5 * arcsinh(pi ** 2 * asymptotic_length * abs(beta2) * cut_carrier.baud_rate *
+                                 (delta_f - 0.5 * pump_carrier.baud_rate))
+        psi *= effective_length ** 2 / (2 * pi * abs(beta2) * asymptotic_length)
+        return psi
 
-        integrand_f1 = zeros(len(f1_array))
-        for f1_index, (f1, psd1_sample) in enumerate(zip(f1_array, psd1)):
-            f3_array = f1 + f2_array - f_eval
-            psd2 = raised_cosine_comb(f2_array, cut_carrier) * (cut_carrier.baud_rate / cut_carrier.power.signal)
-            psd3 = raised_cosine_comb(f3_array, pump_carrier) * (pump_carrier.baud_rate / pump_carrier.power.signal)
-            ggg = psd1_sample * psd2 * psd3
-            delta_beta = 4 * pi**2 * (f1 - f_eval) * (f2_array - f_eval) * \
-                (beta2 + pi * beta3 * (f1 + f2_array - 2 * f_ref_beta))
-            w = 1j * delta_beta - alpha
-            generalized_rho_nli = (rho_pump[-1] ** 2 * exp(w * z[-1]) - rho_pump[0] ** 2 * exp(w * z[0])) / w
-            for z_ind in range(0, len(z) - 1):
-                derivative_rho = (rho_pump[z_ind + 1] ** 2 - rho_pump[z_ind] ** 2) / (z[z_ind + 1] - z[z_ind])
-                generalized_rho_nli -= derivative_rho * (exp(w * z[z_ind + 1]) - exp(w * z[z_ind])) / (w ** 2)
-            generalized_rho_nli = abs(generalized_rho_nli) ** 2
-            integrand_f2 = ggg * generalized_rho_nli
-            integrand_f1[f1_index] = trapz(integrand_f2, f2_array)
-        generalized_psi = trapz(integrand_f1, f1_array)
-        return generalized_psi
 
     # Methods for computing the GGN-model
     @staticmethod
@@ -500,16 +464,17 @@ class NliSolver:
                     g_nli_computed += \
                         spm_weight * ggg * NliSolver._generalized_psi(f_eval, cut_carrier, pump_carrier,
                                                                       f_cut_resolution, f_pump_resolution,
-                                                                      srs, alpha[i], beta2, beta3, f_ref_beta)
+                                                                      srs, alpha[j], beta2, beta3, f_ref_beta)
                 else:  # XPM
                     g_pump = (pump_carrier.power.signal / pump_carrier.baud_rate)
                     ggg = g_cut * g_pump ** 2
                     frequency_offset_threshold = NliSolver._frequency_offset_threshold(beta2, pump_carrier.baud_rate)
-                    if abs(delta_f) <= frequency_offset_threshold:
+                    # if abs(delta_f) <= frequency_offset_threshold:
+                    if delta_f == 0:
                         g_nli_computed += \
                             xpm_weight * ggg * NliSolver._generalized_psi(f_eval, cut_carrier, pump_carrier,
                                                                           f_cut_resolution, f_pump_resolution,
-                                                                          srs, alpha[i], beta2, beta3, f_ref_beta)
+                                                                          srs, alpha[j], beta2, beta3, f_ref_beta)
                     else:
                         g_nli_computed += \
                             xpm_weight * ggg * NliSolver._fast_generalized_psi(f_eval, cut_carrier, pump_carrier,
@@ -541,7 +506,13 @@ class NliSolver:
         for f1_index, f1 in enumerate(f1_array):
             delta_beta = 4 * pi**2 * (f1 - f_eval) * (f2_array - f_eval) * \
                          (beta2 + pi * beta3 * (f1 + f2_array - 2 * f_ref_beta))
-            integrand_f2 = NliSolver._generalized_rho_nli(delta_beta, rho_pump, z, alpha)
+            w = 1j * delta_beta - alpha
+            generalized_rho_nli = (rho_pump[-1] ** 2 * exp(w * z[-1]) - rho_pump[0] ** 2 * exp(w * z[0])) / w
+            for z_ind in range(0, len(z) - 1):
+                derivative_rho = (rho_pump[z_ind + 1] ** 2 - rho_pump[z_ind] ** 2) / (z[z_ind + 1] - z[z_ind])
+                generalized_rho_nli -= derivative_rho * (exp(w * z[z_ind + 1]) - exp(w * z[z_ind])) / (w ** 2)
+            generalized_rho_nli = abs(generalized_rho_nli) ** 2
+            integrand_f2 = generalized_rho_nli
             integrand_f1[f1_index] = 2 * trapz(integrand_f2, f2_array)  # 2x since integrand_f2 is symmetric in f2
         generalized_psi = 0.5 * sum(integrand_f1) * pump_carrier.baud_rate
         return generalized_psi
@@ -553,27 +524,24 @@ class NliSolver:
         :return: generalized_psi
         """
         z = srs.z
-        rho_norm = srs.rho * exp(outer(alpha/2, z))
+        rho_norm = srs.rho * exp(outer(alpha / 2, z))
         rho_pump = interp1d(srs.frequency, rho_norm, axis=0)(pump_carrier.frequency)
-
         f1_array = arange(pump_carrier.frequency - (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2),
                           pump_carrier.frequency + (pump_carrier.baud_rate * (1 + pump_carrier.roll_off) / 2),
                           f_pump_resolution)
         f2_array = arange(cut_carrier.frequency - (cut_carrier.baud_rate * (1 + cut_carrier.roll_off) / 2),
                           cut_carrier.frequency + (cut_carrier.baud_rate * (1 + cut_carrier.roll_off) / 2),
                           f_cut_resolution)
-
-        psd1 = raised_cosine(f1_array, pump_carrier.frequency, pump_carrier.baud_rate, pump_carrier.roll_off)
-        psd2 = raised_cosine(f2_array, cut_carrier.frequency, cut_carrier.baud_rate, cut_carrier.roll_off)
+        psd1 = raised_cosine_comb(f1_array, pump_carrier) * (pump_carrier.baud_rate / pump_carrier.power.signal)
 
         integrand_f1 = zeros(len(f1_array))
         for f1_index, (f1, psd1_sample) in enumerate(zip(f1_array, psd1)):
             f3_array = f1 + f2_array - f_eval
-            psd3 = raised_cosine(f3_array, pump_carrier.frequency, pump_carrier.baud_rate,pump_carrier.roll_off)
+            psd2 = raised_cosine_comb(f2_array, cut_carrier) * (cut_carrier.baud_rate / cut_carrier.power.signal)
+            psd3 = raised_cosine_comb(f3_array, pump_carrier) * (pump_carrier.baud_rate / pump_carrier.power.signal)
             ggg = psd1_sample * psd2 * psd3
-            delta_beta = 4 * pi**2 * (f1 - f_eval) * (f2_array - f_eval) * \
-                (beta2 + pi * beta3 * (f1 + f2_array - 2 * f_ref_beta))
-
+            delta_beta = 4 * pi ** 2 * (f1 - f_eval) * (f2_array - f_eval) * \
+                         (beta2 + pi * beta3 * (f1 + f2_array - 2 * f_ref_beta))
             w = 1j * delta_beta - alpha
             generalized_rho_nli = (rho_pump[-1] ** 2 * exp(w * z[-1]) - rho_pump[0] ** 2 * exp(w * z[0])) / w
             for z_ind in range(0, len(z) - 1):
@@ -584,6 +552,23 @@ class NliSolver:
             integrand_f1[f1_index] = trapz(integrand_f2, f2_array)
         generalized_psi = trapz(integrand_f1, f1_array)
         return generalized_psi
+
+    @staticmethod
+    def _psi(cut_carrier, pump_carrier, alpha, beta2, length):
+        """Calculates eq. 123 from `arXiv:1209.0394 <https://arxiv.org/abs/1209.0394>`__"""
+        effective_length = NliSolver.effective_length(alpha, length)
+        asymptotic_length = 1/alpha
+
+        if cut_carrier.channel_number == pump_carrier.channel_number:  # SCI, SPM
+            psi = arcsinh(0.5 * pi ** 2 * asymptotic_length * abs(beta2) * cut_carrier.baud_rate ** 2)
+        else:  # XCI, XPM
+            delta_f = cut_carrier.frequency - pump_carrier.frequency
+            psi = 0.5 * arcsinh(pi ** 2 * asymptotic_length * abs(beta2) * cut_carrier.baud_rate *
+                                (delta_f + 0.5 * pump_carrier.baud_rate))
+            psi -= 0.5 * arcsinh(pi ** 2 * asymptotic_length * abs(beta2) * cut_carrier.baud_rate *
+                                 (delta_f - 0.5 * pump_carrier.baud_rate))
+        psi *= effective_length ** 2 / (2 * pi * abs(beta2) * asymptotic_length)
+        return psi
 
     @staticmethod
     def _frequency_offset_threshold(beta2, symbol_rate):
